@@ -37,6 +37,7 @@
 #include "opengl_patch.h"
 #include "aasset_patch.h"
 #include "fmod_patch.h"
+#include "qol.h"
 
 /* ── Globals shared with other modules ──────────────────────────────────── */
 
@@ -128,12 +129,21 @@ static int  ret1(void)  { return 1; }
 extern int   g_gamepad_buttons;   /* SDL_CONTROLLER_BUTTON_* mask, see ProcessEvents */
 extern float g_gamepad_axis[6];
 
-int gw3_engine_button_mask(void) {
+/* Raw SDL state -> engine bits.  The R36S labels its face buttons the
+ * Nintendo way (A right, B bottom, X top, Y left) while SDL names them by
+ * position (A = bottom), so by default the engine's A ("confirm") is taken
+ * from the button LABELLED A and B ("back") from the one labelled B; same for
+ * X/Y.  Options > Graphics > BUTTONS (or the port menu) switches to the
+ * positional Xbox layout. */
+static int raw_engine_mask(void) {
     int s = g_gamepad_buttons, m = 0;
-    if (s & 0x001)  m |= 1 << 0;   /* A              */
-    if (s & 0x002)  m |= 1 << 1;   /* B              */
-    if (s & 0x004)  m |= 1 << 2;   /* X              */
-    if (s & 0x008)  m |= 1 << 3;   /* Y              */
+    int nintendo = qol_nintendo_layout();
+    int a = nintendo ? 0x002 : 0x001, b = nintendo ? 0x001 : 0x002;
+    int x = nintendo ? 0x008 : 0x004, y = nintendo ? 0x004 : 0x008;
+    if (s & a)      m |= 1 << 0;   /* A              */
+    if (s & b)      m |= 1 << 1;   /* B              */
+    if (s & x)      m |= 1 << 2;   /* X              */
+    if (s & y)      m |= 1 << 3;   /* Y              */
     if (s & 0x040)  m |= 1 << 4;   /* L1 / LShoulder */
     if (s & 0x080)  m |= 1 << 5;   /* R1 / RShoulder */
     if (g_gamepad_axis[4] > 0.30f) m |= 1 << 6;  /* L2 (analog trigger -> digital) */
@@ -147,16 +157,33 @@ int gw3_engine_button_mask(void) {
     return m;
 }
 
-float gw3_engine_axis(int a) {
+/* This frame's engine-side pad state, latched once per frame by
+ * gw3_input_frame() so the joypad array and the GetJoypad* hooks agree. */
+static int   g_eng_mask;
+static float g_eng_axis[8];
+
+void gw3_input_frame(void) {
+    int m = raw_engine_mask();
+    float ax[8] = {0};
     /* Sticks (0..3) and triggers (4/5) pass through raw: the odroidgo3-joypad
      * kernel driver already does centre calibration / dead-zone, so a second
      * dead-zone in here only eats range and (if per-axis) makes the stick snap
-     * to the cardinals.  Tune stick feel via OS joystick calibration. */
-    if (a >= 0 && a <= 5) return g_gamepad_axis[a];
-    /* axes 6/7 (Hat) left at 0 — D-pad is delivered through button bits 8..11,
-     * which the engine already folds into the combined D-pad InputAxis. */
-    return 0.0f;
+     * to the cardinals.  Tune stick feel via OS joystick calibration.
+     * Axes 6/7 (Hat) stay 0: the D-pad goes through button bits 8..11. */
+    for (int i = 0; i < 6; i++) ax[i] = g_gamepad_axis[i];
+    /* The 1.3.0 console menus only follow the left stick, so the D-pad is
+     * mirrored onto it (in a level the left stick is movement too). */
+    ax[0] += (float)(!!(m & 1 << 11) - !!(m & 1 << 10));
+    ax[1] += (float)(!!(m & 1 << 9)  - !!(m & 1 << 8));
+    for (int i = 0; i < 2; i++) ax[i] = ax[i] > 1.0f ? 1.0f : ax[i] < -1.0f ? -1.0f : ax[i];
+    if (qol_input(&m)) memset(ax, 0, sizeof ax);   /* port menu is up: the game sees nothing */
+    g_eng_mask = m;
+    memcpy(g_eng_axis, ax, sizeof ax);
 }
+
+int gw3_engine_button_mask(void) { return g_eng_mask; }
+
+float gw3_engine_axis(int a) { return (a >= 0 && a < 8) ? g_eng_axis[a] : 0.0f; }
 
 /* Pin User 0 to "physical joypad, one pad connected". */
 static int GetNoJoypads_hook(void) { return 1; }
@@ -1282,32 +1309,10 @@ static void patch_gw3(void) {
         fprintf(stderr, "patch_gw3: FMOD active -> Audio::Init/Update left live\n");
     }
 
-    /* sub_0x226098 is an event/telemetry ring-buffer writer: it copies a name
-     * std::string from this+0x28, bumps 64-bit counters at this+0xd0/+0xe0 and
-     * appends a 16-byte record to the buffer at this+0xc8.  The front end calls
-     * it on the first frame with `this` == NULL (the recorder is set up by the
-     * Java layer we do not have), which faults at libgwnext+0x236b10 reading
-     * [0x28] -- deterministic, every run.  Dropping the records is harmless. */
-    /* 25 overloads of the same "append one event record" method, a contiguous
-     * family at 0x225e04..0x2277bc.  Each copies a name std::string from
-     * this+0x28, bumps 64-bit counters at this+0xd0/+0xe0 and appends a 16-byte
-     * record to the growable buffer at this+0xc8.  The front end calls them on
-     * frame 0 with `this` == NULL (the recorder is created by the Java layer we
-     * do not have), faulting at libgwnext+0x236b10 while reading [0x28].
-     * Hooking only one just moves the crash to a sibling, so drop them all —
-     * they are pure telemetry, nothing reads the buffer back. */
-    static const uint32_t evt_rec[] = {
-        0x225e04, 0x225fc0, 0x226098, 0x2261c0, 0x2262e4, 0x2263bc, 0x2264c8,
-        0x2265d4, 0x2266c4, 0x2267fc, 0x226960, 0x226a58, 0x226b80, 0x226c58,
-        0x226d30, 0x226e68, 0x226fcc, 0x2270c4, 0x22719c, 0x2272c4, 0x2273ec,
-        0x227534, 0x22760c, 0x2276e4, 0x2277bc,
-    };
-    for (size_t i = 0; i < sizeof(evt_rec) / sizeof(evt_rec[0]); i++)
-        hook_addr(gw3_mod.text_base + evt_rec[i], (uintptr_t)ret0);
-    fprintf(stderr, "hook: text_base=%p evt_rec[2]@0x226098 -> %08x %08x (want e51ff004)\n",
-            (void *)gw3_mod.text_base,
-            *(uint32_t *)(gw3_mod.text_base + 0x226098),
-            *(uint32_t *)(gw3_mod.text_base + 0x22609c));
+    /* The 25 Audio::C_AudioSystem command methods (TriggerOneShotSound,
+     * BeginMusicCue, ...) at 0x225e04..0x2277bc used to be stubbed out here
+     * because the front end calls them with this == NULL on frame 0.  They
+     * are now NULL-guarded by name in qol.c, for both game versions. */
 
     /* GW3 joypad: make the engine believe one physical joypad is connected and
      * is User 0's master controller, then feed it live SDL pad state.
@@ -1326,13 +1331,8 @@ static void patch_gw3(void) {
     hook_addr(so_symbol(&gw3_mod, "_Z13GetJoypadAxisii"), (uintptr_t)GetJoypadAxis_hook);
     fprintf(stderr, "patch_gw3: joypad hooks -> NoJoypads=1 MasterType=0 Buttons/Axis=SDL\n");
 
-    /* TODO(gw3): hook the engine's screen-size, per-frame event/poll and input
-     * functions once their symbol names are known. Example shape:
-     *   hook_addr(so_symbol(&gw3_mod, "_ZnnGW_ScreenGetWidthv"), (uintptr_t)OS_ScreenGetWidth);
-     *   hook_addr(so_symbol(&gw3_mod, "_ZnnGW_ProcessEventsv"),   (uintptr_t)ProcessEvents);
-     * Until then the game uses its own internal loop; feed input via JNI (see
-     * jni_patch.c) or evdev once the contract is reverse-engineered. */
-    fprintf(stderr, "patch_gw3: generic hooks installed (game-specific hooks TODO)\n");
+    qol_install();
+    fprintf(stderr, "patch_gw3: generic hooks installed\n");
 }
 
 /* resolve addr via dladdr and write "  TAG: lib + 0xOFFSET  (sym+delta)\n".

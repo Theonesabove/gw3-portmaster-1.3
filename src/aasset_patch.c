@@ -46,6 +46,7 @@
 #include <dirent.h>
 
 #include "aasset_patch.h"
+#include "qol.h"
 
 extern char g_data_path[512];
 
@@ -194,29 +195,39 @@ static void ensure_savegame(void) {
     else     fprintf(stderr, "savegame: CANNOT create %s\n", path);
 }
 
+/* main.<build>.com.activision.gw3.dimensions.obb: the newest build present
+ * (101 = 1.3.0 "Evolved", 35/41 = 1.0.x), else the first *.obb found. */
 static void wad_mount_auto(void) {
     ensure_savegame();
-    char path[640];
-
-    snprintf(path, sizeof(path),
-             "%s/main.35.com.activision.gw3.dimensions.obb", g_data_path);
-    if (access(path, R_OK) == 0) { wad_mount(path); return; }
-
-    /* Fall back to the first *.obb in the data directory. */
+    char path[640], best[300] = "";
+    int best_build = -1;
     DIR *d = opendir(g_data_path);
     if (!d) { fprintf(stderr, "wad: no OBB under %s\n", g_data_path); return; }
     struct dirent *de;
     while ((de = readdir(d))) {
         size_t n = strlen(de->d_name);
-        if (n > 4 && strcasecmp(de->d_name + n - 4, ".obb") == 0) {
-            snprintf(path, sizeof(path), "%s/%s", g_data_path, de->d_name);
-            closedir(d);
-            wad_mount(path);
-            return;
-        }
+        if (n <= 4 || strcasecmp(de->d_name + n - 4, ".obb") != 0) continue;
+        int build = -1;
+        if (sscanf(de->d_name, "main.%d.", &build) != 1) build = 0;
+        if (build > best_build) { best_build = build; snprintf(best, sizeof best, "%s", de->d_name); }
     }
     closedir(d);
-    fprintf(stderr, "wad: no OBB under %s\n", g_data_path);
+    if (!best[0]) { fprintf(stderr, "wad: no OBB under %s\n", g_data_path); return; }
+    snprintf(path, sizeof(path), "%s/%s", g_data_path, best);
+    wad_mount(path);
+}
+
+/* A whole file from the OBB, de-obfuscated into a malloc'd buffer. */
+int aasset_load(const char *name, uint8_t **out, size_t *len) {
+    char norm[512];
+    wad_normalise(name, norm, sizeof(norm));
+    const wad_entry_t *e = wad_find(norm);
+    if (!e || e->off + e->size > g_wad_len) return 0;
+    uint8_t *buf = malloc(e->size ? e->size : 1);
+    if (!buf) return 0;
+    for (uint64_t j = 0; j < e->size; j++) buf[j] = g_wad_map[e->off + j] ^ wad_key(e->off + j);
+    *out = buf; *len = (size_t)e->size;
+    return 1;
 }
 
 /* ── AAssetManager ──────────────────────────────────────────────────────── */
@@ -278,6 +289,25 @@ AAssetManager *AAssetManager_fromJava(void *env, void *jassetmanager) {
     return (AAssetManager *)&marker;
 }
 
+/* filesystem-backed asset: the path as given, then under the data dir */
+static int open_file(aasset_t *a, const char *filename) {
+    FILE *fp = NULL;
+    if (filename[0] == '/') {
+        strncpy(a->path, filename, sizeof(a->path) - 1);
+        fp = fopen(a->path, "rb");
+    } else {
+        snprintf(a->path, sizeof(a->path), "%s/%s", g_data_path, filename);
+        fp = fopen(a->path, "rb");
+        if (!fp) { strncpy(a->path, filename, sizeof(a->path) - 1); fp = fopen(a->path, "rb"); }
+    }
+    if (!fp) return 0;
+    fseek(fp, 0, SEEK_END);
+    a->length = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    a->fp = fp;
+    return 1;
+}
+
 /* mode: AASSET_MODE_UNKNOWN=0, RANDOM=1, STREAMING=2, BUFFER=3 (ignored) */
 AAsset *AAssetManager_open(AAssetManager *mgr, const char *filename, int mode) {
     (void)mgr; (void)mode;
@@ -286,20 +316,24 @@ AAsset *AAssetManager_open(AAssetManager *mgr, const char *filename, int mode) {
     aasset_t *a = calloc(1, sizeof(aasset_t));
     if (!a) return NULL;
 
-    /* 1) direct path, then under the data dir. */
-    snprintf(a->path, sizeof(a->path), "%s/%s", g_data_path, filename);
-    FILE *fp = fopen(a->path, "rb");
-    if (!fp) {
-        strncpy(a->path, filename, sizeof(a->path) - 1);
-        fp = fopen(a->path, "rb");
+    static int trace = -1;
+    if (trace < 0) trace = getenv("GW3_TRACE_ASSETS") != NULL;
+
+    /* 0) our own prompt images / the achievements list (qol.c) */
+    if (filename[0] != '/') {
+        char norm[512];
+        const uint8_t *data; long len;
+        wad_normalise(filename, norm, sizeof(norm));
+        if (wad_find(norm) && qol_asset(norm, &data, &len)) {
+            a->mem = data; a->length = len;
+            if (trace) fprintf(stderr, "asset: %s (replaced, %ld bytes)\n", norm, len);
+            return (AAsset *)a;
+        }
     }
-    if (fp) {
-        fseek(fp, 0, SEEK_END);
-        a->length = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        a->fp = fp;
-        return (AAsset *)a;
-    }
+
+    /* 1) absolute paths (the save) come from disk; relative ones from the OBB
+     *    first, then from the data dir. */
+    if (filename[0] == '/' && open_file(a, filename)) return (AAsset *)a;
 
     /* 2) the packed OBB / WAD. */
     if (g_wad_ent) {
@@ -322,8 +356,8 @@ AAsset *AAssetManager_open(AAssetManager *mgr, const char *filename, int mode) {
                         a->xor_on = 0;
                         a->length = (long)olen;
                         a->pos    = 0;
-                        fprintf(stderr, "wad: open %s (%ld bytes, png-stripped from %llu)\n",
-                                norm, a->length, (unsigned long long)e->size);
+                        if (trace) fprintf(stderr, "wad: open %s (%ld bytes, png-stripped from %llu)\n",
+                                           norm, a->length, (unsigned long long)e->size);
                         return (AAsset *)a;
                     }
                 }
@@ -333,12 +367,15 @@ AAsset *AAssetManager_open(AAssetManager *mgr, const char *filename, int mode) {
             a->xor_on = 1;
             a->length = (long)e->size;
             a->pos    = 0;
-            fprintf(stderr, "wad: open %s (%ld bytes)\n", norm, a->length);
+            if (trace) fprintf(stderr, "wad: open %s (%ld bytes)\n", norm, a->length);
             return (AAsset *)a;
         }
     }
 
-    fprintf(stderr, "AAssetManager_open: missing %s\n", filename);
+    if (filename[0] != '/' && open_file(a, filename)) return (AAsset *)a;
+    /* the engine probes Android/, Console/ and Common/ for most files: only
+     * absolute paths are worth a log line */
+    if (trace || filename[0] == '/') fprintf(stderr, "AAssetManager_open: missing %s\n", filename);
     free(a);
     return NULL;
 }

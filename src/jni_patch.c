@@ -18,6 +18,7 @@
 #include "config.h"
 #include "so_util.h"
 #include "jni_patch.h"
+#include "qol.h"
 
 extern so_module gw3_mod;
 extern char g_data_path[512];
@@ -257,6 +258,7 @@ static void pump_joy_input(void) {
     extern so_module gw3_mod;
     extern int   gw3_engine_button_mask(void);
     extern float gw3_engine_axis(int);
+    extern void  gw3_input_frame(void);
     static int  *joy = NULL;
     static int   resolved = 0;
     if (!resolved) {
@@ -264,6 +266,7 @@ static void pump_joy_input(void) {
         resolved = 1;
         fprintf(stderr, "GW3 input: g_JoypadStates @%p\n", (void *)joy);
     }
+    gw3_input_frame();                          /* latch this frame's pad state */
     if (!joy) return;
     joy[0] = gw3_engine_button_mask();          /* joy0 word 0 = button mask */
     for (int a = 0; a < 8; a++) {
@@ -286,9 +289,14 @@ static char *GetStringUTFChars(void *env, char *str, int *isCopy);
  * from this aspect ratio.  A hardcoded 1024x768 on a 720x720 panel is what made
  * the picture stretched, then overspill the screen once gameplay switched to
  * rendering the backbuffer render target directly. */
+/* 1.3.0 "Evolved" keeps its controller-first console UI for Android TV
+ * (GameConfig.tvDevice).  Set in jni_load() when the engine has the 1.3.0
+ * entry point setJoystickConnected; GW3_PHONE=1 forces the phone UI. */
+int g_tv_mode = 0;
+
 static int config_int_value(const char *name) {
     if (!name) return 0;
-    if (!strcmp(name, "tvDevice"))        return 0;     /* phone */
+    if (!strcmp(name, "tvDevice"))        return g_tv_mode;
     if (!strcmp(name, "nativeWidth"))     return g_screen_w;
     if (!strcmp(name, "nativeHeight"))    return g_screen_h;
     if (!strcmp(name, "targetWidth"))     return g_screen_w;
@@ -309,9 +317,8 @@ static void *config_obj_value(const char *name) {
 static int CallBooleanMethodV(void *env, void *obj, int id, uintptr_t *args) {
     (void)env; (void)obj; (void)args;
     jni_tracef("JNI: CallBooleanMethod id=%d (%s)\n", id, mid_lookup(id));
-    /* Instance-method booleans.  (The per-frame GW3Activity poll that used to
-     * land here was actually GetStaticMethodID at env+0x1C4 — see fill_env.) */
-    return 0;
+    /* Instance-method booleans, and GetBooleanField (GameConfig.tvDevice). */
+    return config_int_value(mid_lookup(id));
 }
 
 /* pcs("aapcs"): float return must go in r0 */
@@ -366,13 +373,106 @@ static int GetStaticFieldID(void *env, void *cls, const char *name, const char *
  * false and every getter answers an empty string: nothing for the front end to
  * wait on.  Anything unrecognised is logged by mid_intern above. */
 static int java_static_bool(const char *name) {
-    (void)name;
+    if (!strcmp(name, "hasJoystick") || !strcmp(name, "isControllerConnected") ||
+        !strcmp(name, "isTVDevice")) return 1;
     return 0;   /* offline / signed-out / no other audio */
+}
+
+/* ── Java byte[] (1.3.0 cloud save) ─────────────────────────────────────────
+ * A jbyteArray is a pointer to { magic, len, data[] }. */
+#define JARR_MAGIC 0x4A415252u
+typedef struct { uint32_t magic, len; uint8_t data[]; } jarr_t;
+/* Arguments of Java calls are scanned for arrays, so membership is checked
+ * against the arrays we handed out instead of dereferencing arbitrary words. */
+static jarr_t *g_jarrs[64];
+static jarr_t *jarr(void *o) {
+    if (!o) return NULL;
+    for (int i = 0; i < 64; i++) if (g_jarrs[i] == o) return (jarr_t *)o;
+    return NULL;
+}
+static void jarr_track(jarr_t *a) {
+    static unsigned next;
+    g_jarrs[next++ % 64] = a;   /* ponytail: ring of 64, oldest arrays forgotten (leaked, never freed) */
+}
+static void *NewByteArray(void *env, int len) {
+    (void)env;
+    if (len < 0) len = 0;
+    jarr_t *a = calloc(1, sizeof(jarr_t) + (size_t)len + 1);
+    if (!a) return NULL;
+    a->magic = JARR_MAGIC; a->len = (uint32_t)len;
+    jarr_track(a);
+    return a;
+}
+static int GetArrayLength(void *env, void *o) { (void)env; jarr_t *a = jarr(o); return a ? (int)a->len : 0; }
+static void *GetByteArrayElements(void *env, void *o, int *isCopy) {
+    (void)env; if (isCopy) *isCopy = 0;
+    jarr_t *a = jarr(o); return a ? a->data : NULL;
+}
+static void ByteArrayRegion(void *o, int start, int len, uint8_t *buf, int set) {
+    jarr_t *a = jarr(o);
+    if (!a || start < 0 || len < 0 || (uint32_t)start + (uint32_t)len > a->len) return;
+    if (set) memcpy(a->data + start, buf, (size_t)len); else memcpy(buf, a->data + start, (size_t)len);
+}
+static void GetByteArrayRegion(void *env, void *o, int start, int len, uint8_t *buf) { (void)env; ByteArrayRegion(o, start, len, buf, 0); }
+static void SetByteArrayRegion(void *env, void *o, int start, int len, uint8_t *buf) { (void)env; ByteArrayRegion(o, start, len, buf, 1); }
+
+/* 1.3.0 keeps its save in "the cloud": CloudSaveRead asks Java to fetch it and
+ * answer later through onSaveGameReadComplete(byte[]); CloudSaveWrite hands
+ * over a byte[].  Both go to cloudsave.bin next to the game.  The read answer
+ * is delivered from the draw loop (as Java would, on its own thread). */
+static volatile int g_cloud_read_pending = 0;
+static void cloud_path(char *out, size_t n) { snprintf(out, n, "%s/cloudsave.bin", g_data_path); }
+
+static void java_static_effects(const char *name, uintptr_t *args) {
+    if (!strcmp(name, "CloudSaveRead")) { g_cloud_read_pending = 1; return; }
+    if (!strncmp(name, "CloudSave", 9)) {           /* CloudSaveWrite / ...: find the byte[] */
+        for (int k = 0; args && k < 4; k++) {
+            jarr_t *a = jarr((void *)args[k]);
+            if (!a) continue;
+            char p[600], tmp[620]; cloud_path(p, sizeof p);
+            snprintf(tmp, sizeof tmp, "%s.tmp", p);
+            FILE *f = fopen(tmp, "wb");
+            if (f) {
+                int ok = fwrite(a->data, 1, a->len, f) == a->len;
+                ok &= fclose(f) == 0;
+                if (ok) rename(tmp, p);
+                fprintf(stderr, "java: %s -> %u bytes%s\n", name, a->len, ok ? "" : " (write failed)");
+            }
+            return;
+        }
+        return;
+    }
+    if (!strcmp(name, "AppShutdown")) {             /* Quit from the game's menu */
+        fprintf(stderr, "java: AppShutdown -> exiting\n");
+        fflush(stderr);
+        _exit(0);
+    }
+}
+
+void jni_deliver_cloud_read(void) {
+    if (!g_cloud_read_pending) return;
+    g_cloud_read_pending = 0;
+    void (*cb)(void *, void *, void *) = (void *)so_symbol(&gw3_mod,
+        "Java_com_activision_gw3_common_GW3JNILib_onSaveGameReadComplete");
+    if (!cb) return;
+    char p[600]; cloud_path(p, sizeof p);
+    void *arr = NULL;
+    FILE *f = fopen(p, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+        if (len > 0 && (arr = NewByteArray(NULL, (int)len)) != NULL &&
+            fread(((jarr_t *)arr)->data, 1, (size_t)len, f) != (size_t)len) arr = NULL;
+        fclose(f);
+    }
+    fprintf(stderr, "java: CloudSaveRead -> %s\n", arr ? "cloudsave.bin" : "no save yet");
+    static int fake_lib;
+    cb(fake_env, &fake_lib, arr);
 }
 
 static int CallStaticBooleanMethodV(void *env, void *obj, int id, uintptr_t *args) {
     (void)env; (void)obj; (void)args;
     const char *name = mid_lookup(id);
+    java_static_effects(name, args);
     int v = java_static_bool(name);
     jni_tracef("JNI: CallStaticBooleanMethod %s -> %d\n", name, v);
     return v;
@@ -381,6 +481,7 @@ static int CallStaticBooleanMethodV(void *env, void *obj, int id, uintptr_t *arg
 static void *CallStaticObjectMethodV(void *env, void *obj, int id, uintptr_t *args) {
     (void)env; (void)obj; (void)args;
     const char *name = mid_lookup(id);
+    java_static_effects(name, args);
     void *v = config_obj_value(name);
     jni_tracef("JNI: CallStaticObjectMethod %s -> \"%s\"\n", name, (char *)v);
     return v;
@@ -389,15 +490,37 @@ static void *CallStaticObjectMethodV(void *env, void *obj, int id, uintptr_t *ar
 static int CallStaticIntMethodV(void *env, void *obj, int id, uintptr_t *args) {
     (void)env; (void)obj; (void)args;
     const char *name = mid_lookup(id);
+    java_static_effects(name, args);
     int v = config_int_value(name);
     jni_tracef("JNI: CallStaticIntMethod %s -> %d\n", name, v);
     return v;
 }
 
 static void CallStaticVoidMethodV(void *env, void *obj, int id, uintptr_t *args) {
-    (void)env; (void)obj; (void)args;
+    (void)env; (void)obj;
     jni_tracef("JNI: CallStaticVoidMethod %s\n", mid_lookup(id));
+    java_static_effects(mid_lookup(id), args);
 }
+
+/* The plain (variadic) and ...A (jvalue[]) variants: collect the first
+ * argument words and share the ...V handlers (which only scan them). */
+#define JNI_VARIANTS(R, X)                                                     \
+static R X##Va(void *env, void *obj, int id, ...) {                           \
+    uintptr_t w[4]; va_list ap; va_start(ap, id);                              \
+    for (int k = 0; k < 4; k++) w[k] = va_arg(ap, uintptr_t);                  \
+    va_end(ap);                                                                \
+    return X##V(env, obj, id, w);                                              \
+}                                                                              \
+static R X##A(void *env, void *obj, int id, uint64_t *jv) {                   \
+    uintptr_t w[4];                                                            \
+    for (int k = 0; k < 4; k++) w[k] = jv ? (uintptr_t)jv[k] : 0;              \
+    return X##V(env, obj, id, w);                                              \
+}
+JNI_VARIANTS(int,    CallStaticBooleanMethod)
+JNI_VARIANTS(void *, CallStaticObjectMethod)
+JNI_VARIANTS(int,    CallStaticIntMethod)
+JNI_VARIANTS(void,   CallStaticVoidMethod)
+#undef JNI_VARIANTS
 
 static int GetVersion(void *env) { (void)env; return 0x00010006; }
 
@@ -530,21 +653,21 @@ static void fill_env(void) {
      * 117/118/119 Boolean, 129/130/131 Int, 135/136/137 Float,
      * 141/142/143 Void.  THIS BLOCK IS THE FIX. */
     *(uintptr_t *)(fake_env + 0x1C4) = (uintptr_t)GetStaticMethodID;
-    *(uintptr_t *)(fake_env + 0x1C8) = (uintptr_t)CallStaticObjectMethodV;
+    *(uintptr_t *)(fake_env + 0x1C8) = (uintptr_t)CallStaticObjectMethodVa;
     *(uintptr_t *)(fake_env + 0x1CC) = (uintptr_t)CallStaticObjectMethodV;
-    *(uintptr_t *)(fake_env + 0x1D0) = (uintptr_t)CallStaticObjectMethodV;
-    *(uintptr_t *)(fake_env + 0x1D4) = (uintptr_t)CallStaticBooleanMethodV;
+    *(uintptr_t *)(fake_env + 0x1D0) = (uintptr_t)CallStaticObjectMethodA;
+    *(uintptr_t *)(fake_env + 0x1D4) = (uintptr_t)CallStaticBooleanMethodVa;
     *(uintptr_t *)(fake_env + 0x1D8) = (uintptr_t)CallStaticBooleanMethodV;
-    *(uintptr_t *)(fake_env + 0x1DC) = (uintptr_t)CallStaticBooleanMethodV;
-    *(uintptr_t *)(fake_env + 0x204) = (uintptr_t)CallStaticIntMethodV;
+    *(uintptr_t *)(fake_env + 0x1DC) = (uintptr_t)CallStaticBooleanMethodA;
+    *(uintptr_t *)(fake_env + 0x204) = (uintptr_t)CallStaticIntMethodVa;
     *(uintptr_t *)(fake_env + 0x208) = (uintptr_t)CallStaticIntMethodV;
-    *(uintptr_t *)(fake_env + 0x20C) = (uintptr_t)CallStaticIntMethodV;
+    *(uintptr_t *)(fake_env + 0x20C) = (uintptr_t)CallStaticIntMethodA;
     *(uintptr_t *)(fake_env + 0x21C) = (uintptr_t)CallFloatMethodV;
     *(uintptr_t *)(fake_env + 0x220) = (uintptr_t)CallFloatMethodV;
     *(uintptr_t *)(fake_env + 0x224) = (uintptr_t)CallFloatMethodV;
-    *(uintptr_t *)(fake_env + 0x234) = (uintptr_t)CallStaticVoidMethodV;
+    *(uintptr_t *)(fake_env + 0x234) = (uintptr_t)CallStaticVoidMethodVa;
     *(uintptr_t *)(fake_env + 0x238) = (uintptr_t)CallStaticVoidMethodV;
-    *(uintptr_t *)(fake_env + 0x23C) = (uintptr_t)CallStaticVoidMethodV;
+    *(uintptr_t *)(fake_env + 0x23C) = (uintptr_t)CallStaticVoidMethodA;
 
     /* static fields: 144 GetStaticFieldID, 145 Object, 146 Boolean, 150 Int */
     *(uintptr_t *)(fake_env + 0x240) = (uintptr_t)GetStaticFieldID;
@@ -559,6 +682,14 @@ static void fill_env(void) {
     *(uintptr_t *)(fake_env + 0x2A4) = (uintptr_t)GetStringUTFChars;
     *(uintptr_t *)(fake_env + 0x2A8) = (uintptr_t)ret0;
     *(uintptr_t *)(fake_env + 0x35C) = (uintptr_t)RegisterNatives;
+    /* byte[]: 171 GetArrayLength, 176 NewByteArray, 184 GetByteArrayElements,
+     * 192 ReleaseByteArrayElements, 200 GetByteArrayRegion, 208 SetByteArrayRegion */
+    *(uintptr_t *)(fake_env + 0x2AC) = (uintptr_t)GetArrayLength;
+    *(uintptr_t *)(fake_env + 0x2C0) = (uintptr_t)NewByteArray;
+    *(uintptr_t *)(fake_env + 0x2E0) = (uintptr_t)GetByteArrayElements;
+    *(uintptr_t *)(fake_env + 0x300) = (uintptr_t)ret0;
+    *(uintptr_t *)(fake_env + 0x320) = (uintptr_t)GetByteArrayRegion;
+    *(uintptr_t *)(fake_env + 0x340) = (uintptr_t)SetByteArrayRegion;
 }
 
 static int GetEnv(void *vm, void **env, int version) {
@@ -641,6 +772,7 @@ void jni_load(void) {
         void (*fn_setGameFilesDir)(void *, void *, void *)      = GW3SYM("setGameFilesDir");
         void (*fn_setPrivateFilesDir)(void *, void *, void *)   = GW3SYM("setPrivateFilesDir");
         void (*fn_setNoJoysticks)(void *, void *, int)          = GW3SYM("setNoJoysticks");
+        void (*fn_setJoystickConnected)(void *, void *, int, int) = GW3SYM("setJoystickConnected"); /* 1.3.0 only */
         void (*fn_viewInitGameConfig)(void *, void *, void *)   = GW3SYM("viewInitGameConfig");
         void (*fn_viewOnSurfaceCreated)(void *, void *)         = GW3SYM("viewOnSurfaceCreated");
         void (*fn_viewOnSurfaceChanged)(void *, void *, int, int)= GW3SYM("viewOnSurfaceChanged");
@@ -657,6 +789,9 @@ void jni_load(void) {
         }
 
         static int fake_thiz, fake_config, fake_am; /* non-NULL fake Java objects */
+        g_tv_mode = fn_setJoystickConnected && !getenv("GW3_PHONE");
+        fprintf(stderr, "GW3: game %s, %s UI\n", fn_setJoystickConnected ? "1.3.0 Evolved" : "1.0.x",
+                g_tv_mode ? "TV/console" : "phone");
         int inches_bits;
         { float f = 5.0f; memcpy(&inches_bits, &f, sizeof f); }
 
@@ -683,6 +818,7 @@ void jni_load(void) {
          * setNoJoysticks(1) sets it; _Z12GetNoJoypadsv is also hooked ->1 in
          * patch_gw3.  Real pad state is fed per-frame by pump_joy_input(). */
         if (fn_setNoJoysticks)      STEP("setNoJoysticks",     fn_setNoJoysticks(fake_env, &fake_thiz, 1));
+        if (fn_setJoystickConnected) STEP("setJoystickConnected", fn_setJoystickConnected(fake_env, &fake_thiz, 0, 1));
         {
             int *p_nojoy = (int *)so_symbol(&gw3_mod, "g_NoJoypads");
             if (p_nojoy) { *p_nojoy = 1; fprintf(stderr, "GW3 input: g_NoJoypads(count) @%p -> 1\n", (void *)p_nojoy); }
@@ -702,7 +838,9 @@ void jni_load(void) {
         for (;;) {
             if (ProcessEvents()) break;
             pump_joy_input();
+            jni_deliver_cloud_read();
             fn_viewOnDrawFrame(fake_env, &fake_thiz);
+            qol_draw(g_screen_w, g_screen_h);
             if (frame == 300) {
                 /* one-shot render probe: is FBO 0 bound, is the backbuffer non-black? */
                 GLint fbo = -1, vp[4] = {0}; GLenum err = glGetError();
