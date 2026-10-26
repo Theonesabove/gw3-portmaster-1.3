@@ -35,7 +35,8 @@ SRCS    := src/main.c \
            src/opengl_patch.c \
            src/aasset_patch.c \
            src/fmod_patch.c \
-           src/fmod_opensl.c
+           src/fmod_opensl.c \
+           src/qol.c
 
 OBJS    := $(SRCS:.c=.o)
 TARGET  := gw3
@@ -171,12 +172,12 @@ $(DATA_PATH):
 	cp extracted/lib/armeabi-v7a/libgwnext.so $@/
 	cp extracted/lib/armeabi-v7a/libfmodex.so $@/
 	cp extracted/lib/armeabi-v7a/libfmodevent.so $@/
-	cp main.35.com.activision.gw3.dimensions.obb $@/
+	cp main.*.com.activision.gw3.dimensions.obb $@/
 
 # Copy binary + data to device (set DEVICE_IP or use SSH)
 install: all data
 	scp $(TARGET) $(DATA_PATH)/libgwnext.so $(DATA_PATH)/libfmodex.so \
-	    $(DATA_PATH)/libfmodevent.so $(DATA_PATH)/main.35.com.activision.gw3.dimensions.obb \
+	    $(DATA_PATH)/libfmodevent.so $(DATA_PATH)/main.*.com.activision.gw3.dimensions.obb \
 	    $(if $(DEVICE_IP),root@$(DEVICE_IP):/roms/ports/gw3/,$(DATA_PATH)/)
 
 # Print all undefined symbols from the engine .so to verify our symbol table

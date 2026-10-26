@@ -37,3 +37,7 @@ Thumbs.db
 gtactw_r36.pm
 bullseye-sysroot/
 scripts/__pycache__/
+
+# scripts/cross-build.sh
+build-armhf/
+focal-sysroot

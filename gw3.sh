@@ -94,7 +94,7 @@ if [ -z "$OBB_FILE" ] || [ ! -f "$GAMEDIR/libgwnext.so" ] \
     echo ""
     echo "  - the game APK  (Geometry*.apk, .xapk or .apkm) — the engine"
     echo "    and FMOD libraries are unpacked from it automatically"
-    echo "  - main.35.com.activision.gw3.dimensions.obb  (game data;"
+    echo "  - main.101.com.activision.gw3.dimensions.obb (1.3.0) or main.35... (1.0.0)  (game data;"
     echo "    an .xapk / .apkm bundle already contains this)"
     echo ""
     echo "Status:"
